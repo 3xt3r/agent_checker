@@ -1,5 +1,0 @@
-cmake_minimum_required(VERSION 3.15)
-project(hello CXX)
-add_executable(hello hello.cpp)
-target_include_directories(hello PUBLIC "include")
-include(${CMAKE_CURRENT_LIST_DIR}/../common/myutils.cmake)

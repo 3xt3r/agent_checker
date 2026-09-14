@@ -1,7 +1,0 @@
-query testQuery($stream: InputABCD!) {
-  control {
-    test(new: $stream) {
-      id
-    }
-  }
-}
