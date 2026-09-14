@@ -1,0 +1,689 @@
+<?php declare(strict_types=1);
+
+/*
+ * This file is part of Composer.
+ *
+ * (c) Nils Adermann <naderman@naderman.de>
+ *     Jordi Boggiano <j.boggiano@seld.be>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Composer\Test;
+
+use Composer\Advisory\Auditor;
+use Composer\Config;
+use Composer\Policy\ListPolicyConfig;
+use Composer\Util\Platform;
+
+class ConfigTest extends TestCase
+{
+    /**
+     * @dataProvider dataAddPackagistRepository
+     * @param mixed[] $expected
+     * @param mixed[] $localConfig
+     * @param ?array<mixed> $systemConfig
+     */
+    public function testAddPackagistRepository(array $expected, array $localConfig, ?array $systemConfig = null): void
+    {
+        $config = new Config(false);
+        if ($systemConfig) {
+            $config->merge(['repositories' => $systemConfig]);
+        }
+        $config->merge(['repositories' => $localConfig]);
+
+        self::assertEquals($expected, $config->getRepositories());
+    }
+
+    public static function dataAddPackagistRepository(): array
+    {
+        $data = [];
+        $data['local config inherits system defaults'] = [
+            [
+                'packagist.org' => ['type' => 'composer', 'url' => 'https://repo.packagist.org'],
+            ],
+            [],
+        ];
+
+        $data['local config can disable system config by name'] = [
+            [],
+            [
+                ['packagist.org' => false],
+            ],
+        ];
+
+        $data['local config can disable system config by name bc'] = [
+            [],
+            [
+                ['packagist' => false],
+            ],
+        ];
+
+        $data['local config adds above defaults'] = [
+            [
+                0 => ['type' => 'vcs', 'url' => 'git://github.com/composer/composer.git'],
+                1 => ['type' => 'pear', 'url' => 'http://pear.composer.org'],
+                'packagist.org' => ['type' => 'composer', 'url' => 'https://repo.packagist.org'],
+            ],
+            [
+                ['type' => 'vcs', 'url' => 'git://github.com/composer/composer.git'],
+                ['type' => 'pear', 'url' => 'http://pear.composer.org'],
+            ],
+        ];
+
+        $data['system config adds above core defaults'] = [
+            [
+                'example.com' => ['type' => 'composer', 'url' => 'http://example.com'],
+                'packagist.org' => ['type' => 'composer', 'url' => 'https://repo.packagist.org'],
+            ],
+            [],
+            [
+                'example.com' => ['type' => 'composer', 'url' => 'http://example.com'],
+            ],
+        ];
+
+        $data['local config can disable repos by name and re-add them anonymously to bring them above system config'] = [
+            [
+                1 => ['type' => 'composer', 'url' => 'http://packagist.org'],
+                'example.com' => ['type' => 'composer', 'url' => 'http://example.com'],
+            ],
+            [
+                ['packagist.org' => false],
+                ['type' => 'composer', 'url' => 'http://packagist.org'],
+            ],
+            [
+                'example.com' => ['type' => 'composer', 'url' => 'http://example.com'],
+            ],
+        ];
+
+        $data['local config can override by name to bring a repo above system config'] = [
+            [
+                'packagist.org' => ['type' => 'composer', 'url' => 'http://packagistnew.org'],
+                'example.com' => ['type' => 'composer', 'url' => 'http://example.com'],
+            ],
+            [
+                'packagist.org' => ['type' => 'composer', 'url' => 'http://packagistnew.org'],
+            ],
+            [
+                'example.com' => ['type' => 'composer', 'url' => 'http://example.com'],
+            ],
+        ];
+
+        $data['local config redefining packagist.org by URL override it if no named keys are used'] = [
+            [
+                ['type' => 'composer', 'url' => 'https://repo.packagist.org'],
+            ],
+            [
+                ['type' => 'composer', 'url' => 'https://repo.packagist.org'],
+            ],
+        ];
+
+        $data['local config redefining packagist.org by URL override it also with named keys'] = [
+            [
+                'example' => ['type' => 'composer', 'url' => 'https://repo.packagist.org'],
+            ],
+            [
+                'example' => ['type' => 'composer', 'url' => 'https://repo.packagist.org'],
+            ],
+        ];
+
+        $data['incorrect local config does not cause ErrorException'] = [
+            [
+                'packagist.org' => ['type' => 'composer', 'url' => 'https://repo.packagist.org'],
+                'type' => 'vcs',
+                'url' => 'http://example.com',
+            ],
+            [
+                'type' => 'vcs',
+                'url' => 'http://example.com',
+            ],
+        ];
+
+        return $data;
+    }
+
+    public function testPreferredInstallAsString(): void
+    {
+        $config = new Config(false);
+        $config->merge(['config' => ['preferred-install' => 'source']]);
+        $config->merge(['config' => ['preferred-install' => 'dist']]);
+
+        self::assertEquals('dist', $config->get('preferred-install'));
+    }
+
+    public function testMergePreferredInstall(): void
+    {
+        $config = new Config(false);
+        $config->merge(['config' => ['preferred-install' => 'dist']]);
+        $config->merge(['config' => ['preferred-install' => ['foo/*' => 'source']]]);
+
+        // This assertion needs to make sure full wildcard preferences are placed last
+        // Handled by composer because we convert string preferences for BC, all other
+        // care for ordering and collision prevention is up to the user
+        self::assertEquals(['foo/*' => 'source', '*' => 'dist'], $config->get('preferred-install'));
+    }
+
+    public function testMergeGithubOauth(): void
+    {
+        $config = new Config(false);
+        $config->merge(['config' => ['github-oauth' => ['foo' => 'bar']]]);
+        $config->merge(['config' => ['github-oauth' => ['bar' => 'baz']]]);
+
+        self::assertEquals(['foo' => 'bar', 'bar' => 'baz'], $config->get('github-oauth'));
+    }
+
+    public function testVarReplacement(): void
+    {
+        $config = new Config(false);
+        $config->merge(['config' => ['a' => 'b', 'c' => '{$a}']]);
+        $config->merge(['config' => ['bin-dir' => '$HOME', 'cache-dir' => '~/foo/']]);
+
+        $home = rtrim(getenv('HOME') ?: getenv('USERPROFILE'), '\\/');
+        self::assertEquals('b', $config->get('c'));
+        self::assertEquals($home, $config->get('bin-dir'));
+        self::assertEquals($home.'/foo', $config->get('cache-dir'));
+    }
+
+    public function testRealpathReplacement(): void
+    {
+        $config = new Config(false, '/foo/bar');
+        $config->merge(['config' => [
+            'bin-dir' => '$HOME/foo',
+            'cache-dir' => '/baz/',
+            'vendor-dir' => 'vendor',
+        ]]);
+
+        $home = rtrim(getenv('HOME') ?: getenv('USERPROFILE'), '\\/');
+        self::assertEquals('/foo/bar/vendor', $config->get('vendor-dir'));
+        self::assertEquals($home.'/foo', $config->get('bin-dir'));
+        self::assertEquals('/baz', $config->get('cache-dir'));
+    }
+
+    public function testStreamWrapperDirs(): void
+    {
+        $config = new Config(false, '/foo/bar');
+        $config->merge(['config' => [
+            'cache-dir' => 's3://baz/',
+        ]]);
+
+        self::assertEquals('s3://baz', $config->get('cache-dir'));
+    }
+
+    public function testFetchingRelativePaths(): void
+    {
+        $config = new Config(false, '/foo/bar');
+        $config->merge(['config' => [
+            'bin-dir' => '{$vendor-dir}/foo',
+            'vendor-dir' => 'vendor',
+        ]]);
+
+        self::assertEquals('/foo/bar/vendor', $config->get('vendor-dir'));
+        self::assertEquals('/foo/bar/vendor/foo', $config->get('bin-dir'));
+        self::assertEquals('vendor', $config->get('vendor-dir', Config::RELATIVE_PATHS));
+        self::assertEquals('vendor/foo', $config->get('bin-dir', Config::RELATIVE_PATHS));
+    }
+
+    public function testOverrideGithubProtocols(): void
+    {
+        $config = new Config(false);
+        $config->merge(['config' => ['github-protocols' => ['https', 'ssh']]]);
+        $config->merge(['config' => ['github-protocols' => ['https']]]);
+
+        self::assertEquals(['https'], $config->get('github-protocols'));
+    }
+
+    public function testGitDisabledByDefaultInGithubProtocols(): void
+    {
+        $config = new Config(false);
+        $config->merge(['config' => ['github-protocols' => ['https', 'git']]]);
+        self::assertEquals(['https'], $config->get('github-protocols'));
+
+        $config->merge(['config' => ['secure-http' => false]]);
+        self::assertEquals(['https', 'git'], $config->get('github-protocols'));
+    }
+
+    /**
+     * @dataProvider allowedUrlProvider
+     * @doesNotPerformAssertions
+     */
+    public function testAllowedUrlsPass(string $url): void
+    {
+        $config = new Config(false);
+        $config->prohibitUrlByConfig($url);
+    }
+
+    /**
+     * @dataProvider prohibitedUrlProvider
+     */
+    public function testProhibitedUrlsThrowException(string $url): void
+    {
+        self::expectException('Composer\Downloader\TransportException');
+        self::expectExceptionMessage('Your configuration does not allow connections to ' . $url);
+        $config = new Config(false);
+        $config->prohibitUrlByConfig($url);
+    }
+
+    /**
+     * @return string[][] List of test URLs that should pass strict security
+     */
+    public static function allowedUrlProvider(): array
+    {
+        $urls = [
+            'https://packagist.org',
+            'git@github.com:composer/composer.git',
+            'hg://user:pass@my.satis/satis',
+            '\\myserver\myplace.git',
+            'file://myserver.localhost/mygit.git',
+            'file://example.org/mygit.git',
+            'git:Department/Repo.git',
+            'ssh://[user@]host.xz[:port]/path/to/repo.git/',
+        ];
+
+        return array_combine($urls, array_map(static function ($e): array {
+            return [$e];
+        }, $urls));
+    }
+
+    /**
+     * @return string[][] List of test URLs that should not pass strict security
+     */
+    public static function prohibitedUrlProvider(): array
+    {
+        $urls = [
+            'http://packagist.org',
+            'http://10.1.0.1/satis',
+            'http://127.0.0.1/satis',
+            'http://💛@example.org',
+            'svn://localhost/trunk',
+            'svn://will.not.resolve/trunk',
+            'svn://192.168.0.1/trunk',
+            'svn://1.2.3.4/trunk',
+            'git://5.6.7.8/git.git',
+        ];
+
+        return array_combine($urls, array_map(static function ($e): array {
+            return [$e];
+        }, $urls));
+    }
+
+    public function testProhibitedUrlsWarningVerifyPeer(): void
+    {
+        $io = $this->getIOMock();
+
+        $io->expects([['text' => '<warning>Warning: Accessing example.org with verify_peer and verify_peer_name disabled.</warning>']], true);
+
+        $config = new Config(false);
+        $config->prohibitUrlByConfig('https://example.org', $io, [
+            'ssl' => [
+                'verify_peer' => false,
+                'verify_peer_name' => false,
+            ],
+        ]);
+    }
+
+    /**
+     * @group TLS
+     */
+    public function testDisableTlsCanBeOverridden(): void
+    {
+        $config = new Config;
+        $config->merge(
+            ['config' => ['disable-tls' => 'false']]
+        );
+        self::assertFalse($config->get('disable-tls'));
+        $config->merge(
+            ['config' => ['disable-tls' => 'true']]
+        );
+        self::assertTrue($config->get('disable-tls'));
+    }
+
+    public function testProcessTimeout(): void
+    {
+        Platform::putEnv('COMPOSER_PROCESS_TIMEOUT', '0');
+        $config = new Config(true);
+        $result = $config->get('process-timeout');
+        Platform::clearEnv('COMPOSER_PROCESS_TIMEOUT');
+
+        self::assertEquals(0, $result);
+    }
+
+    public function testHtaccessProtect(): void
+    {
+        Platform::putEnv('COMPOSER_HTACCESS_PROTECT', '0');
+        $config = new Config(true);
+        $result = $config->get('htaccess-protect');
+        Platform::clearEnv('COMPOSER_HTACCESS_PROTECT');
+
+        self::assertEquals(0, $result);
+    }
+
+    public function testGetSourceOfValue(): void
+    {
+        Platform::clearEnv('COMPOSER_PROCESS_TIMEOUT');
+
+        $config = new Config;
+
+        self::assertSame(Config::SOURCE_DEFAULT, $config->getSourceOfValue('process-timeout'));
+
+        $config->merge(
+            ['config' => ['process-timeout' => 1]],
+            'phpunit-test'
+        );
+
+        self::assertSame('phpunit-test', $config->getSourceOfValue('process-timeout'));
+    }
+
+    public function testGetSourceOfValueEnvVariables(): void
+    {
+        Platform::putEnv('COMPOSER_HTACCESS_PROTECT', '0');
+        $config = new Config;
+        $result = $config->getSourceOfValue('htaccess-protect');
+        Platform::clearEnv('COMPOSER_HTACCESS_PROTECT');
+
+        self::assertEquals('COMPOSER_HTACCESS_PROTECT', $result);
+    }
+
+    public function testAudit(): void
+    {
+        $config = new Config(true);
+        $result = $config->get('audit');
+        self::assertArrayHasKey('abandoned', $result);
+        self::assertArrayHasKey('ignore', $result);
+        self::assertSame(ListPolicyConfig::AUDIT_FAIL, $result['abandoned']);
+        self::assertSame([], $result['ignore']);
+
+        Platform::putEnv('COMPOSER_AUDIT_ABANDONED', ListPolicyConfig::AUDIT_IGNORE);
+        $result = $config->get('audit');
+        Platform::clearEnv('COMPOSER_AUDIT_ABANDONED');
+        self::assertArrayHasKey('abandoned', $result);
+        self::assertArrayHasKey('ignore', $result);
+        self::assertSame(ListPolicyConfig::AUDIT_IGNORE, $result['abandoned']);
+        self::assertSame([], $result['ignore']);
+
+        $config->merge(['config' => ['audit' => ['ignore' => ['A', 'B']]]]);
+        $config->merge(['config' => ['audit' => ['ignore' => ['A', 'C']]]]);
+        $result = $config->get('audit');
+        self::assertArrayHasKey('ignore', $result);
+        self::assertSame(['A', 'B', 'A', 'C'], $result['ignore']);
+
+        // Test COMPOSER_SECURITY_BLOCKING_ABANDONED env var
+        Platform::putEnv('COMPOSER_SECURITY_BLOCKING_ABANDONED', '1');
+        $result = $config->get('audit');
+        Platform::clearEnv('COMPOSER_SECURITY_BLOCKING_ABANDONED');
+        self::assertArrayHasKey('block-abandoned', $result);
+        self::assertSame(true, $result['block-abandoned']);
+
+        Platform::putEnv('COMPOSER_SECURITY_BLOCKING_ABANDONED', '0');
+        $result = $config->get('audit');
+        Platform::clearEnv('COMPOSER_SECURITY_BLOCKING_ABANDONED');
+        self::assertArrayHasKey('block-abandoned', $result);
+        self::assertSame(false, $result['block-abandoned']);
+    }
+
+    public function testPolicy(): void
+    {
+        $config = new Config(true);
+        $result = $config->get('policy');
+
+        $this->assertTrue($result);
+
+        $config->merge([
+            'config' => [
+                'policy' => [
+                    'advisories' => [
+                        'ignore' => [
+                            'acme/package',
+                        ]
+                    ],
+                ],
+            ]
+        ]);
+        $config->merge([
+            'config' => [
+                'policy' => [
+                    'advisories' => [
+                        'ignore-severities' => ['low']
+                    ],
+                ],
+            ],
+        ]);
+        $result = $config->get('policy');
+        self::assertIsArray($result);
+        self::assertSame(['ignore' => ['acme/package'], 'ignore-severities' => ['low'], ], $result['advisories'] ?? []);
+
+        // COMPOSER_POLICY=1 is a no-op when policy is already enabled — the existing
+        // array config is preserved, not flattened back to the `true` shorthand.
+        Platform::putEnv('COMPOSER_POLICY', '1');
+        $resultWithEnvOn = $config->get('policy');
+        Platform::clearEnv('COMPOSER_POLICY');
+        self::assertIsArray($resultWithEnvOn);
+        self::assertSame(['ignore' => ['acme/package'], 'ignore-severities' => ['low']], $resultWithEnvOn['advisories'] ?? []);
+
+        $config->merge(['config' => ['policy' => true]]);
+        self::assertIsArray($config->get('policy'));
+
+        $config->merge(['config' => ['policy' => false]]);
+        self::assertFalse($config->get('policy'));
+
+        // COMPOSER_POLICY=1 re-enables policy when the config has it disabled.
+        Platform::putEnv('COMPOSER_POLICY', '1');
+        self::assertTrue($config->get('policy'));
+        Platform::clearEnv('COMPOSER_POLICY');
+
+        // The disable path still wins — env var of 0 forces policy off regardless
+        // of any prior array config.
+        Platform::putEnv('COMPOSER_POLICY', '0');
+        self::assertFalse($config->get('policy'));
+        Platform::clearEnv('COMPOSER_POLICY');
+
+        $config->merge(['config' => ['policy' => true]]);
+        self::assertSame([], $config->get('policy'));
+    }
+
+    public function testPolicyListBoolTrueAndEmptyObjectAreEquivalentInLayering(): void
+    {
+        $configBoolTrue = new Config(false);
+        $configBoolTrue->merge(['config' => ['policy' => ['advisories' => true]]]);
+        $configBoolTrue->merge(['config' => ['policy' => ['advisories' => ['audit' => 'report']]]]);
+
+        $configEmptyObj = new Config(false);
+        $configEmptyObj->merge(['config' => ['policy' => ['advisories' => []]]]);
+        $configEmptyObj->merge(['config' => ['policy' => ['advisories' => ['audit' => 'report']]]]);
+
+        self::assertSame($configBoolTrue->get('policy'), $configEmptyObj->get('policy'));
+    }
+
+    public function testPolicyListFalseOverridesPriorTrueOrEmptyEquallyAcrossLayers(): void
+    {
+        // Layering `false` on top of either `true` or `{}` must disable the
+        // list — users should not see different outcomes depending on which
+        // "default-equivalent" shorthand the previous layer happened to use.
+        $configFromTrue = new Config(false);
+        $configFromTrue->merge(['config' => ['policy' => ['advisories' => true]]]);
+        $configFromTrue->merge(['config' => ['policy' => ['advisories' => false]]]);
+
+        $configFromEmpty = new Config(false);
+        $configFromEmpty->merge(['config' => ['policy' => ['advisories' => []]]]);
+        $configFromEmpty->merge(['config' => ['policy' => ['advisories' => false]]]);
+
+        self::assertSame($configFromTrue->get('policy'), $configFromEmpty->get('policy'));
+        self::assertFalse($configFromTrue->get('policy')['advisories'] ?? null);
+    }
+
+    public function testPolicyMasterTrueAfterDetailedConfigDoesNotEraseDetail(): void
+    {
+        // A later layer that does `policy: true` (i.e. "default enabled") must
+        // not erase a previously-stored detailed policy config — that was the
+        // original intent of the special-case in Config::merge and the
+        // canonicalisation must preserve it.
+        $config = new Config(false);
+        $config->merge(['config' => ['policy' => ['advisories' => ['block' => false]]]]);
+        $config->merge(['config' => ['policy' => true]]);
+
+        $result = $config->get('policy');
+        self::assertIsArray($result);
+        self::assertArrayHasKey('advisories', $result);
+        self::assertSame(['block' => false], $result['advisories']);
+    }
+
+    public function testPolicyDeepMergesIgnoreAcrossSources(): void
+    {
+        $config = new Config(true);
+
+        $config->merge(['config' => ['policy' => [
+            'advisories' => [
+                'ignore' => ['vendor/global-1', 'vendor/global-2'],
+                'ignore-id' => ['CVE-1111'],
+                'ignore-severity' => ['low'],
+                'block' => true,
+            ],
+        ]]]);
+        $config->merge(['config' => ['policy' => [
+            'advisories' => [
+                'ignore' => ['vendor/project-1'],
+                'ignore-id' => ['CVE-2222'],
+                'ignore-severity' => ['medium'],
+                'audit' => 'report',
+            ],
+        ]]]);
+
+        $result = $config->get('policy');
+        self::assertIsArray($result);
+        self::assertArrayHasKey('advisories', $result);
+
+        // Deep-merged inner arrays (mirrors audit.ignore behaviour)
+        self::assertSame(
+            ['vendor/global-1', 'vendor/global-2', 'vendor/project-1'],
+            $result['advisories']['ignore']
+        );
+        self::assertSame(['CVE-1111', 'CVE-2222'], $result['advisories']['ignore-id']);
+        self::assertSame(['low', 'medium'], $result['advisories']['ignore-severity']);
+
+        // Sibling scalar keys still merge top-level (later wins, but both retained)
+        self::assertTrue($result['advisories']['block']);
+        self::assertSame('report', $result['advisories']['audit']);
+    }
+
+    public function testPolicyDeepMergesIgnoreForMalwareAndAbandonedAndCustomList(): void
+    {
+        $config = new Config(true);
+
+        $config->merge(['config' => ['policy' => [
+            'malware' => [
+                'ignore' => ['vendor/global-malware'],
+                'ignore-source' => ['source-global'],
+            ],
+            'abandoned' => [
+                'ignore' => ['vendor/global-abandoned'],
+            ],
+            'custom-list' => [
+                'ignore' => ['vendor/global-custom'],
+            ],
+        ]]]);
+        $config->merge(['config' => ['policy' => [
+            'malware' => [
+                'ignore' => ['vendor/project-malware'],
+                'ignore-source' => ['source-project'],
+            ],
+            'abandoned' => [
+                'ignore' => ['vendor/project-abandoned'],
+            ],
+            'custom-list' => [
+                'ignore' => ['vendor/project-custom'],
+            ],
+        ]]]);
+
+        $result = $config->get('policy');
+        self::assertIsArray($result);
+        self::assertSame(
+            ['vendor/global-malware', 'vendor/project-malware'],
+            $result['malware']['ignore']
+        );
+        self::assertSame(
+            ['source-global', 'source-project'],
+            $result['malware']['ignore-source']
+        );
+        self::assertSame(
+            ['vendor/global-abandoned', 'vendor/project-abandoned'],
+            $result['abandoned']['ignore']
+        );
+        self::assertSame(
+            ['vendor/global-custom', 'vendor/project-custom'],
+            $result['custom-list']['ignore']
+        );
+    }
+
+    public function testGetDefaultsToAnEmptyArray(): void
+    {
+        $config = new Config;
+        $keys = [
+            'bitbucket-oauth',
+            'github-oauth',
+            'gitlab-oauth',
+            'gitlab-token',
+            'forgejo-token',
+            'http-basic',
+            'bearer',
+        ];
+        foreach ($keys as $key) {
+            $value = $config->get($key);
+            self::assertIsArray($value);
+            self::assertCount(0, $value);
+        }
+    }
+
+    public function testMergesPluginConfig(): void
+    {
+        $config = new Config(false);
+        $config->merge(['config' => ['allow-plugins' => ['some/plugin' => true]]]);
+        self::assertEquals(['some/plugin' => true], $config->get('allow-plugins'));
+
+        $config->merge(['config' => ['allow-plugins' => ['another/plugin' => true]]]);
+        self::assertEquals(['some/plugin' => true, 'another/plugin' => true], $config->get('allow-plugins'));
+    }
+
+    public function testOverridesGlobalBooleanPluginsConfig(): void
+    {
+        $config = new Config(false);
+        $config->merge(['config' => ['allow-plugins' => true]]);
+        self::assertEquals(true, $config->get('allow-plugins'));
+
+        $config->merge(['config' => ['allow-plugins' => ['another/plugin' => true]]]);
+        self::assertEquals(['another/plugin' => true], $config->get('allow-plugins'));
+    }
+
+    public function testAllowsAllPluginsFromLocalBoolean(): void
+    {
+        $config = new Config(false);
+        $config->merge(['config' => ['allow-plugins' => ['some/plugin' => true]]]);
+        self::assertEquals(['some/plugin' => true], $config->get('allow-plugins'));
+
+        $config->merge(['config' => ['allow-plugins' => true]]);
+        self::assertEquals(true, $config->get('allow-plugins'));
+    }
+
+    public function testSourceFallbackDefaultsToFalse(): void
+    {
+        $config = new Config(false);
+        self::assertFalse($config->get('source-fallback'));
+    }
+
+    public function testSourceFallbackCanBeDisabled(): void
+    {
+        $config = new Config(false);
+        $config->merge(['config' => ['source-fallback' => false]]);
+        self::assertFalse($config->get('source-fallback'));
+    }
+
+    public function testSourceFallbackCanBeSetFromString(): void
+    {
+        $config = new Config(false);
+        $config->merge(['config' => ['source-fallback' => 'false']]);
+        self::assertFalse($config->get('source-fallback'));
+
+        $config->merge(['config' => ['source-fallback' => 'true']]);
+        self::assertTrue($config->get('source-fallback'));
+    }
+
+}

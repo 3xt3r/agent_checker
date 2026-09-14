@@ -1,0 +1,754 @@
+<?php declare(strict_types=1);
+
+/*
+ * This file is part of Composer.
+ *
+ * (c) Nils Adermann <naderman@naderman.de>
+ *     Jordi Boggiano <j.boggiano@seld.be>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Composer\Test\Util;
+
+use Composer\Exception\SecurityException;
+use Composer\Json\JsonFile;
+use Composer\Test\Mock\ProcessExecutorMock;
+use Composer\Util\Perforce;
+use Composer\Test\TestCase;
+use Composer\Util\ProcessExecutor;
+
+/**
+ * @author Matt Whittom <Matt.Whittom@veteransunited.com>
+ */
+class PerforceTest extends TestCase
+{
+    /** @var Perforce */
+    protected $perforce;
+    /** @var ProcessExecutorMock */
+    protected $processExecutor;
+    /** @var array<string, string> */
+    protected $repoConfig;
+    /** @var \PHPUnit\Framework\MockObject\MockObject&\Composer\IO\IOInterface */
+    protected $io;
+
+    private const TEST_DEPOT = 'depot';
+    private const TEST_BRANCH = 'branch';
+    private const TEST_P4USER = 'user';
+    private const TEST_CLIENT_NAME = 'TEST';
+    private const TEST_PORT = 'port';
+    private const TEST_PATH = 'path';
+
+    protected function setUp(): void
+    {
+        $this->processExecutor = $this->getProcessExecutorMock();
+        $this->repoConfig = $this->getTestRepoConfig();
+        $this->io = $this->getMockIOInterface();
+        $this->createNewPerforceWithWindowsFlag(true);
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    public function getTestRepoConfig(): array
+    {
+        return [
+            'depot' => self::TEST_DEPOT,
+            'branch' => self::TEST_BRANCH,
+            'p4user' => self::TEST_P4USER,
+            'unique_perforce_client_name' => self::TEST_CLIENT_NAME,
+        ];
+    }
+
+    /**
+     * @return \PHPUnit\Framework\MockObject\MockObject&\Composer\IO\IOInterface
+     */
+    public function getMockIOInterface()
+    {
+        return $this->getMockBuilder('Composer\IO\IOInterface')->getMock();
+    }
+
+    protected function createNewPerforceWithWindowsFlag(bool $flag): void
+    {
+        $this->perforce = new Perforce($this->repoConfig, self::TEST_PORT, self::TEST_PATH, $this->processExecutor, $flag, $this->io);
+    }
+
+    public function testGetClientWithoutStream(): void
+    {
+        $client = $this->perforce->getClient();
+
+        $expected = 'composer_perforce_TEST_depot';
+        self::assertEquals($expected, $client);
+    }
+
+    public function testGetClientFromStream(): void
+    {
+        $this->setPerforceToStream();
+
+        $client = $this->perforce->getClient();
+
+        $expected = 'composer_perforce_TEST_depot_branch';
+        self::assertEquals($expected, $client);
+    }
+
+    public function testGetStreamWithoutStream(): void
+    {
+        $stream = $this->perforce->getStream();
+        self::assertEquals("//depot", $stream);
+    }
+
+    public function testGetStreamWithStream(): void
+    {
+        $this->setPerforceToStream();
+
+        $stream = $this->perforce->getStream();
+        self::assertEquals('//depot/branch', $stream);
+    }
+
+    public function testGetStreamWithoutLabelWithStreamWithoutLabel(): void
+    {
+        $stream = $this->perforce->getStreamWithoutLabel('//depot/branch');
+        self::assertEquals('//depot/branch', $stream);
+    }
+
+    public function testGetStreamWithoutLabelWithStreamWithLabel(): void
+    {
+        $stream = $this->perforce->getStreamWithoutLabel('//depot/branching@label');
+        self::assertEquals('//depot/branching', $stream);
+    }
+
+    public function testGetClientSpec(): void
+    {
+        $clientSpec = $this->perforce->getP4ClientSpec();
+        $expected = 'path/composer_perforce_TEST_depot.p4.spec';
+        self::assertEquals($expected, $clientSpec);
+    }
+
+    public function testGenerateP4Command(): void
+    {
+        $p4Command = $this->perforce->generateP4Command(['do', 'something']);
+        $expected = ['p4', '-u', 'user', '-c', 'composer_perforce_TEST_depot', '-p', 'port', 'do', 'something'];
+        self::assertEquals($expected, $p4Command);
+    }
+
+    public function testQueryP4UserWithUserAlreadySet(): void
+    {
+        $this->perforce->queryP4User();
+        self::assertEquals(self::TEST_P4USER, $this->perforce->getUser());
+    }
+
+    public function testQueryP4UserWithUserSetInP4VariablesWithWindowsOS(): void
+    {
+        $this->createNewPerforceWithWindowsFlag(true);
+        $this->perforce->setUser(null);
+        $this->processExecutor->expects(
+            [['cmd' => 'p4 set', 'stdout' => 'P4USER=TEST_P4VARIABLE_USER' . PHP_EOL, 'return' => 0]],
+            true
+        );
+
+        $this->perforce->queryP4User();
+        self::assertEquals('TEST_P4VARIABLE_USER', $this->perforce->getUser());
+    }
+
+    public function testQueryP4UserWithUserSetInP4VariablesNotWindowsOS(): void
+    {
+        $this->createNewPerforceWithWindowsFlag(false);
+        $this->perforce->setUser(null);
+
+        $this->processExecutor->expects(
+            [['cmd' => 'echo $P4USER', 'stdout' => 'TEST_P4VARIABLE_USER' . PHP_EOL, 'return' => 0]],
+            true
+        );
+
+        $this->perforce->queryP4User();
+        self::assertEquals('TEST_P4VARIABLE_USER', $this->perforce->getUser());
+    }
+
+    public function testQueryP4UserQueriesForUser(): void
+    {
+        $this->perforce->setUser(null);
+        $expectedQuestion = 'Enter P4 User:';
+        $this->io->method('ask')
+                 ->with($this->equalTo($expectedQuestion))
+                 ->willReturn('TEST_QUERY_USER');
+        $this->perforce->queryP4User();
+        self::assertEquals('TEST_QUERY_USER', $this->perforce->getUser());
+    }
+
+    public function testQueryP4UserStoresResponseToQueryForUserWithWindows(): void
+    {
+        $this->createNewPerforceWithWindowsFlag(true);
+        $this->perforce->setUser(null);
+        $expectedQuestion = 'Enter P4 User:';
+        $expectedCommand = 'p4 set P4USER='.ProcessExecutor::escape('TEST_QUERY_USER');
+        $this->io->expects($this->once())
+                 ->method('ask')
+                 ->with($this->equalTo($expectedQuestion))
+                 ->willReturn('TEST_QUERY_USER');
+
+        $this->processExecutor->expects(
+            [
+                'p4 set',
+                $expectedCommand,
+            ],
+            true
+        );
+
+        $this->perforce->queryP4User();
+    }
+
+    public function testQueryP4UserStoresResponseToQueryForUserWithoutWindows(): void
+    {
+        $this->createNewPerforceWithWindowsFlag(false);
+        $this->perforce->setUser(null);
+        $expectedQuestion = 'Enter P4 User:';
+        $expectedCommand = 'export P4USER='.ProcessExecutor::escape('TEST_QUERY_USER');
+        $this->io->expects($this->once())
+                 ->method('ask')
+                 ->with($this->equalTo($expectedQuestion))
+                 ->willReturn('TEST_QUERY_USER');
+        $this->processExecutor->expects(
+            [
+                'echo $P4USER',
+                $expectedCommand,
+            ],
+            true
+        );
+        $this->perforce->queryP4User();
+    }
+
+    public function testQueryP4UserEscapesInjectionOnWindows(): void
+    {
+        $this->createNewPerforceWithWindowsFlag(true);
+        $this->perforce->setUser(null);
+        $this->io->method('ask')->willReturn('foo && calc.exe');
+        $this->processExecutor->expects(
+            [
+                'p4 set',
+                'p4 set P4USER=' . ProcessExecutor::escape('foo && calc.exe'),
+            ],
+            true
+        );
+        $this->perforce->queryP4User();
+    }
+
+    public function testQueryP4UserEscapesInjectionOnUnix(): void
+    {
+        $this->createNewPerforceWithWindowsFlag(false);
+        $this->perforce->setUser(null);
+        $this->io->method('ask')->willReturn('foo; id');
+        $this->processExecutor->expects(
+            [
+                'echo $P4USER',
+                'export P4USER=' . ProcessExecutor::escape('foo; id'),
+            ],
+            true
+        );
+        $this->perforce->queryP4User();
+    }
+
+    public function testQueryP4PasswordWithPasswordAlreadySet(): void
+    {
+        $repoConfig = [
+            'depot' => 'depot',
+            'branch' => 'branch',
+            'p4user' => 'user',
+            'p4password' => 'TEST_PASSWORD',
+        ];
+        $this->perforce = new Perforce($repoConfig, 'port', 'path', $this->processExecutor, false, $this->getMockIOInterface());
+        $password = $this->perforce->queryP4Password();
+        self::assertEquals('TEST_PASSWORD', $password);
+    }
+
+    public function testQueryP4PasswordWithPasswordSetInP4VariablesWithWindowsOS(): void
+    {
+        $this->createNewPerforceWithWindowsFlag(true);
+
+        $this->processExecutor->expects(
+            [['cmd' => 'p4 set', 'stdout' => 'P4PASSWD=TEST_P4VARIABLE_PASSWORD' . PHP_EOL, 'return' => 0]],
+            true
+        );
+
+        $password = $this->perforce->queryP4Password();
+        self::assertEquals('TEST_P4VARIABLE_PASSWORD', $password);
+    }
+
+    public function testQueryP4PasswordWithPasswordSetInP4VariablesNotWindowsOS(): void
+    {
+        $this->createNewPerforceWithWindowsFlag(false);
+
+        $this->processExecutor->expects(
+            [['cmd' => 'echo $P4PASSWD', 'stdout' => 'TEST_P4VARIABLE_PASSWORD' . PHP_EOL, 'return' => 0]],
+            true
+        );
+
+        $password = $this->perforce->queryP4Password();
+        self::assertEquals('TEST_P4VARIABLE_PASSWORD', $password);
+    }
+
+    public function testQueryP4PasswordQueriesForPassword(): void
+    {
+        $expectedQuestion = 'Enter password for Perforce user user: ';
+        $this->io->expects($this->once())
+            ->method('askAndHideAnswer')
+            ->with($this->equalTo($expectedQuestion))
+            ->willReturn('TEST_QUERY_PASSWORD');
+
+        $password = $this->perforce->queryP4Password();
+        self::assertEquals('TEST_QUERY_PASSWORD', $password);
+    }
+
+    public function testWriteP4ClientSpecWithoutStream(): void
+    {
+        $stream = fopen('php://memory', 'w+');
+        if (false === $stream) {
+            self::fail('Could not open memory stream');
+        }
+        $this->perforce->writeClientSpecToFile($stream);
+
+        rewind($stream);
+
+        $expectedArray = $this->getExpectedClientSpec(false);
+        try {
+            foreach ($expectedArray as $expected) {
+                self::assertStringStartsWith($expected, (string) fgets($stream));
+            }
+            self::assertFalse(fgets($stream));
+        } catch (\Exception $e) {
+            fclose($stream);
+            throw $e;
+        }
+        fclose($stream);
+    }
+
+    public function testWriteP4ClientSpecWithStream(): void
+    {
+        $this->setPerforceToStream();
+        $stream = fopen('php://memory', 'w+');
+        if (false === $stream) {
+            self::fail('Could not open memory stream');
+        }
+
+        $this->perforce->writeClientSpecToFile($stream);
+        rewind($stream);
+
+        $expectedArray = $this->getExpectedClientSpec(true);
+        try {
+            foreach ($expectedArray as $expected) {
+                self::assertStringStartsWith($expected, (string) fgets($stream));
+            }
+            self::assertFalse(fgets($stream));
+        } catch (\Exception $e) {
+            fclose($stream);
+            throw $e;
+        }
+        fclose($stream);
+    }
+
+    public function testIsLoggedIn(): void
+    {
+        $this->processExecutor->expects(
+            [['cmd' => ['p4', '-u', 'user', '-p', 'port', 'login', '-s']]],
+            true
+        );
+        $this->perforce->isLoggedIn();
+    }
+
+    public function testGetBranchesWithStream(): void
+    {
+        $this->setPerforceToStream();
+
+        $this->processExecutor->expects(
+            [
+                [
+                    'cmd' => ['p4', '-u', 'user', '-c', 'composer_perforce_TEST_depot_branch', '-p', 'port', 'streams', '//depot/...'],
+                    'stdout' => 'Stream //depot/branch mainline none \'branch\'' . PHP_EOL,
+                ],
+                [
+                    'cmd' => ['p4', '-u', 'user', '-p', 'port', 'changes', '//depot/branch/...'],
+                    'stdout' => 'Change 1234 on 2014/03/19 by Clark.Stuth@Clark.Stuth_test_client \'test changelist\'',
+                ],
+            ],
+            true
+        );
+
+        $branches = $this->perforce->getBranches();
+        self::assertEquals('//depot/branch@1234', $branches['master']);
+    }
+
+    public function testGetBranchesWithoutStream(): void
+    {
+        $this->processExecutor->expects(
+            [
+                [
+                    'cmd' => ['p4', '-u', 'user', '-p', 'port', 'changes', '//depot/...'],
+                    'stdout' => 'Change 5678 on 2014/03/19 by Clark.Stuth@Clark.Stuth_test_client \'test changelist\'',
+                ],
+            ],
+            true
+        );
+
+        $branches = $this->perforce->getBranches();
+        self::assertEquals('//depot@5678', $branches['master']);
+    }
+
+    public function testGetTagsWithoutStream(): void
+    {
+        $this->processExecutor->expects(
+            [
+                [
+                    'cmd' => ['p4', '-u', 'user', '-c', 'composer_perforce_TEST_depot', '-p', 'port', 'labels'],
+                    'stdout' => 'Label 0.0.1 2013/07/31 \'First Label!\'' . PHP_EOL . 'Label 0.0.2 2013/08/01 \'Second Label!\'' . PHP_EOL,
+                ],
+            ],
+            true
+        );
+
+        $tags = $this->perforce->getTags();
+        self::assertEquals('//depot@0.0.1', $tags['0.0.1']);
+        self::assertEquals('//depot@0.0.2', $tags['0.0.2']);
+    }
+
+    public function testGetTagsWithStream(): void
+    {
+        $this->setPerforceToStream();
+
+        $this->processExecutor->expects(
+            [
+                [
+                    'cmd' => ['p4', '-u', 'user', '-c', 'composer_perforce_TEST_depot_branch', '-p', 'port', 'labels'],
+                    'stdout' => 'Label 0.0.1 2013/07/31 \'First Label!\'' . PHP_EOL . 'Label 0.0.2 2013/08/01 \'Second Label!\'' . PHP_EOL,
+                ],
+            ],
+            true
+        );
+
+        $tags = $this->perforce->getTags();
+        self::assertEquals('//depot/branch@0.0.1', $tags['0.0.1']);
+        self::assertEquals('//depot/branch@0.0.2', $tags['0.0.2']);
+    }
+
+    public function testCheckStreamWithoutStream(): void
+    {
+        $result = $this->perforce->checkStream();
+        self::assertFalse($result);
+        self::assertFalse($this->perforce->isStream());
+    }
+
+    public function testCheckStreamWithStream(): void
+    {
+        $this->processExecutor->expects(
+            [
+                [
+                    'cmd' => ['p4', '-u', 'user', '-p', 'port', 'depots'],
+                    'stdout' => 'Depot depot 2013/06/25 stream /p4/1/depots/depot/... \'Created by Me\'',
+                ],
+            ],
+            true
+        );
+
+        $result = $this->perforce->checkStream();
+        self::assertTrue($result);
+        self::assertTrue($this->perforce->isStream());
+    }
+
+    public function testGetComposerInformationWithoutLabelWithoutStream(): void
+    {
+        $this->processExecutor->expects(
+            [
+                [
+                    'cmd' => ['p4', '-u', 'user', '-c', 'composer_perforce_TEST_depot', '-p', 'port', 'print', '//depot/composer.json'],
+                    'stdout' => PerforceTest::getComposerJson(),
+                ],
+            ],
+            true
+        );
+
+        $result = $this->perforce->getComposerInformation('//depot');
+        $expected = [
+            'name' => 'test/perforce',
+            'description' => 'Basic project for testing',
+            'minimum-stability' => 'dev',
+            'autoload' => ['psr-0' => []],
+        ];
+        self::assertEquals($expected, $result);
+    }
+
+    public function testGetComposerInformationWithLabelWithoutStream(): void
+    {
+        $this->processExecutor->expects(
+            [
+                [
+                    'cmd' => ['p4', '-u', 'user', '-p', 'port', 'files', '//depot/composer.json@0.0.1'],
+                    'stdout' => '//depot/composer.json#1 - branch change 10001 (text)',
+                ],
+                [
+                    'cmd' => ['p4', '-u', 'user', '-c', 'composer_perforce_TEST_depot', '-p', 'port', 'print', '//depot/composer.json@10001'],
+                    'stdout' => PerforceTest::getComposerJson(),
+                ],
+            ],
+            true
+        );
+
+        $result = $this->perforce->getComposerInformation('//depot@0.0.1');
+
+        $expected = [
+            'name' => 'test/perforce',
+            'description' => 'Basic project for testing',
+            'minimum-stability' => 'dev',
+            'autoload' => ['psr-0' => []],
+        ];
+        self::assertEquals($expected, $result);
+    }
+
+    public function testGetComposerInformationWithoutLabelWithStream(): void
+    {
+        $this->setPerforceToStream();
+
+        $this->processExecutor->expects(
+            [
+                [
+                    'cmd' => ['p4', '-u', 'user', '-c', 'composer_perforce_TEST_depot_branch', '-p', 'port', 'print', '//depot/branch/composer.json'],
+                    'stdout' => PerforceTest::getComposerJson(),
+                ],
+            ],
+            true
+        );
+
+        $result = $this->perforce->getComposerInformation('//depot/branch');
+
+        $expected = [
+            'name' => 'test/perforce',
+            'description' => 'Basic project for testing',
+            'minimum-stability' => 'dev',
+            'autoload' => ['psr-0' => []],
+        ];
+        self::assertEquals($expected, $result);
+    }
+
+    public function testGetComposerInformationWithLabelWithStream(): void
+    {
+        $this->processExecutor->expects(
+            [
+                [
+                    'cmd' => ['p4', '-u', 'user', '-p', 'port', 'files', '//depot/branch/composer.json@0.0.1'],
+                    'stdout' => '//depot/composer.json#1 - branch change 10001 (text)',
+                ],
+                [
+                    'cmd' => ['p4', '-u', 'user', '-c', 'composer_perforce_TEST_depot_branch', '-p', 'port', 'print', '//depot/branch/composer.json@10001'],
+                    'stdout' => PerforceTest::getComposerJson(),
+                ],
+            ],
+            true
+        );
+
+        $this->setPerforceToStream();
+
+        $result = $this->perforce->getComposerInformation('//depot/branch@0.0.1');
+
+        $expected = [
+            'name' => 'test/perforce',
+            'description' => 'Basic project for testing',
+            'minimum-stability' => 'dev',
+            'autoload' => ['psr-0' => []],
+        ];
+        self::assertEquals($expected, $result);
+    }
+
+    public function testSyncCodeBaseWithoutStream(): void
+    {
+        $this->processExecutor->expects(
+            [['cmd' => ['p4', '-u', 'user', '-c', 'composer_perforce_TEST_depot', '-p', 'port', 'sync', '-f', '@label']]],
+            true
+        );
+
+        $this->perforce->syncCodeBase('label');
+    }
+
+    public function testSyncCodeBaseWithStream(): void
+    {
+        $this->setPerforceToStream();
+
+        $this->processExecutor->expects(
+            [['cmd' => ['p4', '-u', 'user', '-c', 'composer_perforce_TEST_depot_branch', '-p', 'port', 'sync', '-f', '@label']]],
+            true
+        );
+
+        $this->perforce->syncCodeBase('label');
+    }
+
+    public function testCheckServerExists(): void
+    {
+        $this->processExecutor->expects(
+            [
+                ['p4', '-p', 'perforce.does.exist:port', 'info', '-s'],
+            ],
+            true
+        );
+
+        $result = $this->perforce->checkServerExists('perforce.does.exist:port', $this->processExecutor);
+        self::assertTrue($result);
+    }
+
+    public function testCheckServerExistsRejectsCommandExecutingPort(): void
+    {
+        // no process must be started at all for a rsh:/jsh: endpoint, as the p4 client would
+        // execute it instead of connecting to a server
+        $this->processExecutor->expects([], true);
+
+        self::assertFalse(Perforce::checkServerExists('rsh:touch /tmp/pwned', $this->processExecutor));
+    }
+
+    /**
+     * @dataProvider provideValidPorts
+     */
+    public function testIsValidPortAcceptsNetworkEndpoints(string $port): void
+    {
+        self::assertTrue(Perforce::isValidPort($port));
+    }
+
+    /**
+     * @return array<array{string}>
+     */
+    public static function provideValidPorts(): array
+    {
+        return [
+            ['1666'],
+            ['perforce'],
+            ['p4.example.org:1666'],
+            ['perforce.does.exist:port'],
+            ['tcp:p4.example.org:1666'],
+            ['tcp4:p4.example.org:1666'],
+            ['ssl:p4.example.org:1666'],
+            ['SSL:p4.example.org:1666'],
+            ['ssl64:[2001:db8::1]:1666'],
+            ['tcp6:[::1]:1666'],
+        ];
+    }
+
+    /**
+     * @dataProvider provideInvalidPorts
+     */
+    public function testIsValidPortRejectsNonNetworkEndpoints(string $port): void
+    {
+        self::assertFalse(Perforce::isValidPort($port));
+    }
+
+    /**
+     * @return array<array{string}>
+     */
+    public static function provideInvalidPorts(): array
+    {
+        return [
+            // rsh:/jsh: make the p4 client run the rest of the value as a local command
+            ['rsh:/tmp/evil.sh'],
+            ['rsh:evil'],
+            ['RSH:evil'],
+            [' rsh:evil'],
+            ['jsh:evil'],
+            ['JsH:evil'],
+            ['rsh :evil'],
+            // not valid endpoints either way
+            ['tcp:p4.example.org:1666; touch /tmp/pwned'],
+            ['https://example.org/vendor/pkg.git'],
+            ['-p1666'],
+            [''],
+        ];
+    }
+
+    public function testCreatingPerforceWithCommandExecutingPortThrows(): void
+    {
+        self::expectException(SecurityException::class);
+        self::expectExceptionMessage('Invalid Perforce port (rsh:touch /tmp/pwned)');
+
+        new Perforce($this->repoConfig, 'rsh:touch /tmp/pwned', self::TEST_PATH, $this->processExecutor, false, $this->io);
+    }
+
+    /**
+     * Test if "p4" command is missing.
+     *
+     * @covers \Composer\Util\Perforce::checkServerExists
+     */
+    public function testCheckServerClientError(): void
+    {
+        $processExecutor = $this->getMockBuilder('Composer\Util\ProcessExecutor')->getMock();
+
+        $expectedCommand = ['p4', '-p', 'perforce.does.exist:port', 'info', '-s'];
+        $processExecutor->expects($this->once())
+            ->method('execute')
+            ->with($this->equalTo($expectedCommand), $this->equalTo(null))
+            ->willReturn(127);
+
+        $result = $this->perforce->checkServerExists('perforce.does.exist:port', $processExecutor);
+        self::assertFalse($result);
+    }
+
+    public static function getComposerJson(): string
+    {
+        return JsonFile::encode([
+            'name' => 'test/perforce',
+            'description' => 'Basic project for testing',
+            'minimum-stability' => 'dev',
+            'autoload' => [
+                'psr-0' => [],
+            ],
+        ], JSON_FORCE_OBJECT);
+    }
+
+    /**
+     * @return string[]
+     */
+    private function getExpectedClientSpec(bool $withStream): array
+    {
+        $expectedArray = [
+            'Client: composer_perforce_TEST_depot',
+            PHP_EOL,
+            'Update:',
+            PHP_EOL,
+            'Access:',
+            'Owner:  user',
+            PHP_EOL,
+            'Description:',
+            '  Created by user from composer.',
+            PHP_EOL,
+            'Root: path',
+            PHP_EOL,
+            'Options:  noallwrite noclobber nocompress unlocked modtime rmdir',
+            PHP_EOL,
+            'SubmitOptions:  revertunchanged',
+            PHP_EOL,
+            'LineEnd:  local',
+            PHP_EOL,
+        ];
+        if ($withStream) {
+            $expectedArray[] = 'Stream:';
+            $expectedArray[] = '  //depot/branch';
+        } else {
+            $expectedArray[] = 'View:  //depot/...  //composer_perforce_TEST_depot/...';
+        }
+
+        return $expectedArray;
+    }
+
+    private function setPerforceToStream(): void
+    {
+        $this->perforce->setStream('//depot/branch');
+    }
+
+    public function testCleanupClientSpecShouldDeleteClient(): void
+    {
+        $fs = $this->getMockBuilder('Composer\Util\Filesystem')->getMock();
+        $this->perforce->setFilesystem($fs);
+
+        $testClient = $this->perforce->getClient();
+        $this->processExecutor->expects(
+            [['cmd' => ['p4', '-u', self::TEST_P4USER, '-p', self::TEST_PORT, 'client', '-d', $testClient]]],
+            true
+        );
+
+        $fs->expects($this->once())->method('remove')->with($this->perforce->getP4ClientSpec());
+
+        $this->perforce->cleanupClientSpec();
+    }
+}
